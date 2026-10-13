@@ -33,9 +33,9 @@
 **/INTEGRATION.md
 **/RANDOM_WORKSHOP.md
 **/website.html
-/random-studio/tests/test_server.py
-/random-studio/tests/test_workflow.py
-/random-studio/tests/test_launcher.py
+/apps/random-studio/tests/test_server.py
+/apps/random-studio/tests/test_workflow.py
+/apps/random-studio/tests/test_launcher.py
 
 # Local Python/test and operating-system artifacts
 **/__pycache__/
