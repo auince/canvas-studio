@@ -1,0 +1,803 @@
+from __future__ import annotations
+
+import asyncio
+import copy
+import logging
+import secrets
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from .comfy import ComfyAborted, ComfyError, extract_images, extract_positive_prompt
+from .catalog import PromptCatalog
+from .history import HistoryStore
+from .prompt_rules import PromptRuleStore
+from .workflow import (
+    DETAILER_NODES,
+    MAX_SAMPLE_SEED,
+    WorkflowError,
+    WorkflowTemplates,
+    validate_loras,
+    validate_settings,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+class BatchConflict(RuntimeError):
+    pass
+
+
+MAX_QUEUE = 20
+REGENERATION_MODES = {"replay", "prompt_variant", "content_redraw", "settings_reroll"}
+PROMPT_SECTIONS = ("character", "clothing", "pose", "background", "expression")
+
+
+def validate_seeds(value: Any) -> dict[str, int] | None:
+    """校验复现用的固定种子。None 表示每张图随机(默认行为)。"""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise WorkflowError("seeds 必须是对象")
+    unknown = set(value) - {"sample_seed", "prompt_seed"}
+    if unknown:
+        raise WorkflowError(f"seeds 包含未知参数: {', '.join(sorted(unknown))}")
+    result: dict[str, int] = {}
+    for name, maximum in (("sample_seed", MAX_SAMPLE_SEED), ("prompt_seed", 2**31 - 1)):
+        raw = value.get(name)
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise WorkflowError(f"seeds.{name} 必须是整数")
+        if not 0 <= raw <= maximum:
+            raise WorkflowError(f"seeds.{name} 必须在 0-{maximum} 之间")
+        result[name] = raw
+    return result
+
+
+class BatchManager:
+    def __init__(
+        self,
+        templates: WorkflowTemplates,
+        history: HistoryStore,
+        comfy: Any,
+        catalog: PromptCatalog | None = None,
+        prompt_rules: PromptRuleStore | None = None,
+        image_vault: Any | None = None,
+        comfy_workers: list[Any] | None = None,
+    ):
+        self.templates = templates
+        self.history = history
+        self.comfy = comfy
+        self.comfy_workers = list(comfy_workers or [])
+        self.active_clients: list[Any] = [comfy]
+        self.client_ids: list[str] = [str(uuid.uuid4())]
+        self.task: asyncio.Task[None] | None = None
+        self.state: dict[str, Any] | None = None
+        self.stop_requested = False
+        self.client_id = self.client_ids[0]
+        self.catalog = catalog
+        self.prompt_rules = prompt_rules
+        self.image_vault = image_vault
+        # 排队中的批次(仅内存;WebUI 重启后队列清空,历史记录只在真正开跑时创建)。
+        self.queue: list[dict[str, Any]] = []
+        self.shutting_down = False
+        # 实时进度:由 _monitor_progress 通过 ComfyUI websocket 更新。
+        self.preview: tuple[int, str, bytes] | None = None
+        self._monitor_tasks: list[asyncio.Task[None]] = []
+        self._worker_progress: list[dict[str, int] | None] = []
+        self._history_update_lock = asyncio.Lock()
+        self._preview_seq = 0
+        # start 里的资源校验要 await 多次 ComfyUI 请求,期间若不上锁,
+        # 第二个并发 start 也能通过 active() 检查并启动重复批次。
+        self._start_lock = asyncio.Lock()
+
+    def active(self) -> bool:
+        return bool(self.task and not self.task.done())
+
+    @staticmethod
+    def _validate_regeneration(value: Any) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise WorkflowError("regeneration 必须是对象")
+        unknown = set(value) - {
+            "mode",
+            "frozen_positive_prompt",
+            "frozen_negative_prompt",
+            "fixed_selection",
+            "redraw_sections",
+            "original_selection",
+            "prompt_seed",
+        }
+        if unknown:
+            raise WorkflowError(
+                f"regeneration 包含未知参数: {', '.join(sorted(unknown))}"
+            )
+        mode = value.get("mode")
+        if mode not in REGENERATION_MODES:
+            raise WorkflowError("regeneration.mode 无效")
+        result = copy.deepcopy(value)
+        result["mode"] = mode
+        if mode in {"replay", "prompt_variant"}:
+            positive = str(value.get("frozen_positive_prompt") or "")
+            if not positive.strip():
+                raise WorkflowError("历史记录缺少可回放的最终正向提示词")
+            result["frozen_positive_prompt"] = positive
+            result["frozen_negative_prompt"] = str(
+                value.get("frozen_negative_prompt") or ""
+            )
+            fixed_selection = value.get("fixed_selection") or {}
+            if not isinstance(fixed_selection, dict):
+                raise WorkflowError("regeneration.fixed_selection 必须是对象")
+            result["fixed_selection"] = copy.deepcopy(fixed_selection)
+            if mode == "prompt_variant":
+                prompt_seed = value.get("prompt_seed")
+                if isinstance(prompt_seed, bool) or not isinstance(prompt_seed, int):
+                    raise WorkflowError("regeneration.prompt_seed 必须是整数")
+                if not 0 <= prompt_seed <= 2**31 - 1:
+                    raise WorkflowError("regeneration.prompt_seed 超出范围")
+                result["prompt_seed"] = prompt_seed
+        elif mode == "content_redraw":
+            sections = value.get("redraw_sections")
+            if not isinstance(sections, list) or not sections:
+                raise WorkflowError("content_redraw 至少选择一个重抽维度")
+            if any(not isinstance(section, str) for section in sections):
+                raise WorkflowError("regeneration.redraw_sections 必须是字符串数组")
+            if len(sections) != len(set(sections)):
+                raise WorkflowError("重抽维度不能重复")
+            invalid = set(sections) - set(PROMPT_SECTIONS)
+            if invalid:
+                raise WorkflowError(f"不支持的重抽维度: {', '.join(sorted(invalid))}")
+            fixed_selection = value.get("fixed_selection") or {}
+            original_selection = value.get("original_selection") or {}
+            if not isinstance(fixed_selection, dict) or not isinstance(
+                original_selection, dict
+            ):
+                raise WorkflowError("历史实际抽取结果无效")
+            result["redraw_sections"] = list(sections)
+            result["fixed_selection"] = copy.deepcopy(fixed_selection)
+            result["original_selection"] = copy.deepcopy(original_selection)
+        return result
+
+    async def resource_issues(self, overrides: dict[str, Any]) -> list[dict[str, str]]:
+        settings = validate_settings(overrides)
+        issues: list[dict[str, str]] = []
+        lora_filenames = getattr(self.comfy, "lora_filenames", None)
+        available_loras = {
+            str(value).replace("\\", "/").casefold(): str(value)
+            for value in await lora_filenames()
+        } if lora_filenames else {}
+        for item in settings["loras"]:
+            if item["enabled"] and item["filename"].replace("\\", "/").casefold() not in available_loras:
+                issues.append({"type": "lora", "name": item["filename"], "label": "LoRA"})
+        resource_inventory = getattr(self.comfy, "resource_inventory", None)
+        if resource_inventory:
+            resources = await resource_inventory()
+            checks = [
+                ("model", "主模型", settings["model_name"], resources.get("models", [])),
+                ("sampler", "Sampler", settings["sampler_name"], resources.get("samplers", [])),
+                ("scheduler", "Scheduler", settings["scheduler"], resources.get("schedulers", [])),
+            ]
+            if settings["second_sampler"]["enabled"]:
+                checks.extend(
+                    [
+                        (
+                            "second_sampler",
+                            "2ndSampler Sampler",
+                            settings["second_sampler"]["sampler_name"],
+                            resources.get("samplers", []),
+                        ),
+                        (
+                            "second_scheduler",
+                            "2ndSampler Scheduler",
+                            settings["second_sampler"]["scheduler"],
+                            resources.get("schedulers", []),
+                        ),
+                    ]
+                )
+            if settings["hires"]["enabled"]:
+                checks.append(
+                    (
+                        "upscale_model",
+                        "高清模型",
+                        settings["hires"]["model_name"],
+                        resources.get("upscale_models", []),
+                    )
+                )
+            for kind, label, name, available in checks:
+                if name not in available:
+                    issues.append({"type": kind, "name": name, "label": label})
+            if any(settings["detailers"].values()):
+                sam_name = self._ui_widget_name(7)
+                if sam_name not in resources.get("sam_models", []):
+                    issues.append({"type": "sam_model", "name": sam_name, "label": "SAM 模型"})
+                for detailer, config in DETAILER_NODES.items():
+                    if not settings["detailers"].get(detailer):
+                        continue
+                    detector_name = self._ui_widget_name(config["detector"])
+                    if detector_name not in resources.get("detectors", []):
+                        issues.append({"type": f"{detailer}_detector", "name": detector_name, "label": f"{detailer} 检测模型"})
+        return issues
+
+    def _ui_widget_name(self, node_id: int) -> str:
+        for node in self.templates.ui.get("nodes") or []:
+            if node.get("id") == node_id:
+                values = node.get("widgets_values") or []
+                return str(values[0]) if values else ""
+        return ""
+
+    async def _disable_unavailable_detailers(
+        self, settings: dict[str, Any], clients: list[Any]
+    ) -> list[str]:
+        """Disable optional detailers whose model files are absent on any GPU.
+
+        A batch should still generate when optional hand/face refiners have not
+        been installed. This also protects multi-GPU runs from worker model-list
+        differences which would otherwise fail after dispatch with an opaque 400.
+        """
+        warnings: list[str] = []
+        if not any(settings["detailers"].values()):
+            return warnings
+        inventory_clients: list[tuple[Any, dict[str, Any]]] = []
+        for client in clients:
+            resource_inventory = getattr(client, "resource_inventory", None)
+            if resource_inventory is None:
+                continue
+            try:
+                inventory_clients.append((client, await resource_inventory()))
+            except Exception as error:
+                logger.warning("读取 %s 的细修资源失败: %s", getattr(client, "base_url", "ComfyUI"), error)
+                inventory_clients.append((client, {}))
+        if not inventory_clients:
+            return warnings
+
+        sam_name = self._ui_widget_name(7)
+        sam_missing = [
+            getattr(client, "base_url", "ComfyUI")
+            for client, inventory in inventory_clients
+            if sam_name not in inventory.get("sam_models", [])
+        ]
+        for detailer, config in DETAILER_NODES.items():
+            if not settings["detailers"].get(detailer):
+                continue
+            detector_name = self._ui_widget_name(config["detector"])
+            detector_missing = [
+                getattr(client, "base_url", "ComfyUI")
+                for client, inventory in inventory_clients
+                if detector_name not in inventory.get("detectors", [])
+            ]
+            if sam_missing or detector_missing:
+                settings["detailers"][detailer] = False
+                missing = []
+                if detector_missing:
+                    missing.append(f"检测模型 {detector_name}")
+                if sam_missing:
+                    missing.append(f"SAM 模型 {sam_name}")
+                warnings.append(
+                    f"已跳过{detailer}细修：未在所有启用的 GPU 工作者上找到" + "、".join(missing)
+                )
+        return warnings
+
+    async def start(
+        self,
+        overrides: dict[str, Any],
+        seeds: dict[str, int] | None = None,
+        regeneration: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        async with self._start_lock:
+            regeneration = self._validate_regeneration(regeneration)
+            normalized_overrides = overrides
+            if self.prompt_rules is not None and not (
+                regeneration and regeneration.get("frozen_positive_prompt")
+            ):
+                normalized_overrides, _ = self.prompt_rules.normalize_settings(overrides)
+            settings = validate_settings(normalized_overrides)
+            seeds = validate_seeds(seeds)
+            if self.catalog and not (
+                regeneration and regeneration.get("frozen_positive_prompt")
+            ):
+                self.catalog.validate_settings(settings)
+            lora_filenames = getattr(self.comfy, "lora_filenames", None)
+            if not lora_filenames:
+                raise ComfyError("ComfyUI 客户端无法读取 LoRA 列表")
+            settings["loras"] = validate_loras(settings, await lora_filenames())
+            resource_inventory = getattr(self.comfy, "resource_inventory", None)
+            if resource_inventory:
+                resources = await resource_inventory()
+                if settings["model_name"] not in resources.get("models", []):
+                    raise WorkflowError(f"主模型不存在: {settings['model_name']}")
+                if settings["hires"]["enabled"] and settings["hires"]["model_name"] not in resources.get("upscale_models", []):
+                    raise WorkflowError(f"高清修复模型不存在: {settings['hires']['model_name']}")
+                if settings["sampler_name"] not in resources.get("samplers", []):
+                    raise WorkflowError(f"Sampler 不可用: {settings['sampler_name']}")
+                if settings["scheduler"] not in resources.get("schedulers", []):
+                    raise WorkflowError(f"Scheduler 不可用: {settings['scheduler']}")
+                if settings["second_sampler"]["enabled"]:
+                    second_sampler = settings["second_sampler"]
+                    if second_sampler["sampler_name"] not in resources.get("samplers", []):
+                        raise WorkflowError(f"2ndSampler Sampler 不可用: {second_sampler['sampler_name']}")
+                    if second_sampler["scheduler"] not in resources.get("schedulers", []):
+                        raise WorkflowError(f"2ndSampler Scheduler 不可用: {second_sampler['scheduler']}")
+            clients = (await self._available_clients())[: max(1, settings["count"])]
+            resource_warnings = await self._disable_unavailable_detailers(settings, clients)
+            if self.active():
+                # 有批次在跑:进入队列,当前批次结束后自动接续。
+                if len(self.queue) >= MAX_QUEUE:
+                    raise BatchConflict(f"队列已满(最多 {MAX_QUEUE} 个)")
+                entry = {
+                    "queue_id": f"queue_{uuid.uuid4().hex[:8]}",
+                    "settings": settings,
+                    "seeds": seeds,
+                    "regeneration": regeneration,
+                    "clients": clients,
+                    "warnings": resource_warnings,
+                }
+                self.queue.append(entry)
+                return {
+                    "status": "queued",
+                    "queue_id": entry["queue_id"],
+                    "position": len(self.queue),
+                    "count": settings["count"],
+                    "warnings": resource_warnings,
+                }
+            await self._begin_batch(settings, seeds, regeneration, clients, resource_warnings)
+            return self.snapshot()
+
+    async def _available_clients(self) -> list[Any]:
+        """Use every configured ComfyUI worker that answers health checks; keep primary mandatory."""
+        available = [self.comfy]
+        for worker in self.comfy_workers:
+            try:
+                await worker.status()
+            except Exception as error:
+                logger.warning(
+                    "跳过不可用的 ComfyUI GPU worker %s: %s",
+                    getattr(worker, "base_url", "unknown"),
+                    error,
+                )
+                continue
+            available.append(worker)
+        return available
+
+    async def _begin_batch(
+        self,
+        settings: dict[str, Any],
+        seeds: dict[str, int] | None,
+        regeneration: dict[str, Any] | None = None,
+        clients: list[Any] | None = None,
+        warnings: list[str] | None = None,
+    ) -> None:
+        batch_id = uuid.uuid4().hex[:12]
+        self.stop_requested = False
+        self.preview = None
+        candidates = list(clients or [self.comfy])
+        self.active_clients = candidates[: max(1, min(settings["count"], len(candidates)))]
+        self.client_ids = [str(uuid.uuid4()) for _ in self.active_clients]
+        self.client_id = self.client_ids[0]
+        self._worker_progress = [None for _ in self.active_clients]
+        self.state = {
+            "id": batch_id,
+            "status": "running",
+            "total": settings["count"],
+            "completed": 0,
+            "current": 0,
+            "prompt_id": "",
+            "error": "",
+            "settings": settings,
+            "warnings": list(warnings or []),
+            "gpu_workers": [
+                {
+                    "index": index,
+                    "url": getattr(client, "base_url", "local"),
+                    "status": "idle",
+                    "sequence": None,
+                }
+                for index, client in enumerate(self.active_clients)
+            ],
+        }
+        await self.history.create_batch(batch_id, settings["count"], settings)
+        self.task = asyncio.create_task(
+            self._run(batch_id, settings, seeds, regeneration, self.active_clients, self.client_ids)
+        )
+        self._ensure_monitors()
+
+    def queue_snapshot(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "queue_id": entry["queue_id"],
+                "position": index + 1,
+                "count": entry["settings"]["count"],
+                "model_name": entry["settings"]["model_name"],
+            }
+            for index, entry in enumerate(self.queue)
+        ]
+
+    def remove_queued(self, queue_id: str) -> bool:
+        previous = len(self.queue)
+        self.queue = [entry for entry in self.queue if entry["queue_id"] != queue_id]
+        return len(self.queue) < previous
+
+    def snapshot(self) -> dict[str, Any] | None:
+        return dict(self.state) if self.state else None
+
+    async def request_stop(self, batch_id: str, clear_queue: bool = True) -> dict[str, Any]:
+        if not self.state or self.state["id"] != batch_id:
+            raise KeyError(batch_id)
+        if clear_queue:
+            self.queue.clear()
+        if self.active():
+            self.stop_requested = True
+            self.state["status"] = "stopping"
+            await self.history.update_batch(batch_id, status="stopping")
+            await asyncio.gather(
+                *(self._interrupt_current(client) for client in self.active_clients),
+                return_exceptions=True,
+            )
+        return self.snapshot()
+
+    async def wait(self) -> dict[str, Any] | None:
+        # 队列自动接续会替换 self.task,循环等待直到全部批次收尾。
+        while self.task and not self.task.done():
+            await self.task
+            await asyncio.sleep(0)
+        return self.snapshot()
+
+    async def _run(
+        self,
+        batch_id: str,
+        settings: dict[str, Any],
+        seeds: dict[str, int] | None = None,
+        regeneration: dict[str, Any] | None = None,
+        clients: list[Any] | None = None,
+        client_ids: list[str] | None = None,
+    ) -> None:
+        clients = list(clients or [self.comfy])
+        client_ids = list(client_ids or [self.client_id])
+        sequence_queue: asyncio.Queue[int] = asyncio.Queue()
+        for sequence in range(1, settings["count"] + 1):
+            sequence_queue.put_nowait(sequence)
+        errors: list[Exception] = []
+
+        async def worker_loop(worker_index: int, client: Any) -> None:
+            while not self.stop_requested:
+                try:
+                    sequence = sequence_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                worker_state = self.state["gpu_workers"][worker_index]
+                worker_state["status"] = "starting"
+                worker_state["sequence"] = sequence
+                self.state["current"] = max(int(self.state.get("current") or 0), sequence)
+                try:
+                    await self._generate_one(
+                        batch_id,
+                        settings,
+                        sequence,
+                        client,
+                        client_ids[worker_index],
+                        seeds,
+                        regeneration,
+                    )
+                except ComfyAborted:
+                    await self._interrupt_current(client)
+                    self.stop_requested = True
+                    return
+                except Exception as error:
+                    logger.warning(
+                        "批次 %s 第 %s 张在 GPU worker %s 出错: %s",
+                        batch_id,
+                        sequence,
+                        worker_index,
+                        error,
+                    )
+                    if not errors:
+                        errors.append(error)
+                    self.stop_requested = True
+                    await asyncio.gather(
+                        *(self._interrupt_current(active) for active in clients),
+                        return_exceptions=True,
+                    )
+                    return
+                finally:
+                    sequence_queue.task_done()
+                    if not errors:
+                        worker_state["status"] = "idle"
+                        worker_state["sequence"] = None
+
+        try:
+            await asyncio.gather(
+                *(worker_loop(index, client) for index, client in enumerate(clients))
+            )
+            if errors:
+                status = "error"
+                self.state["error"] = str(errors[0])
+            else:
+                status = "stopped" if self.stop_requested else "completed"
+            self.state["status"] = status
+            await self.history.update_batch(batch_id, completed=self.state["completed"], status=status)
+            if errors:
+                await self.history.update_batch(
+                    batch_id,
+                    completed=self.state["completed"],
+                    status="error",
+                    error=str(errors[0]),
+                )
+        except asyncio.CancelledError:
+            self.stop_requested = True
+            await asyncio.gather(
+                *(self._interrupt_current(client) for client in clients),
+                return_exceptions=True,
+            )
+            raise
+        except Exception as error:
+            logger.warning("批次 %s 出错: %s", batch_id, error)
+            self.state["status"] = "error"
+            self.state["error"] = str(error)
+            await self.history.update_batch(
+                batch_id,
+                completed=self.state["completed"],
+                status="error",
+                error=str(error),
+            )
+        finally:
+            await self._advance_queue()
+
+    async def _generate_one(
+        self,
+        batch_id: str,
+        settings: dict[str, Any],
+        sequence: int,
+        client: Any,
+        client_id: str,
+        seeds: dict[str, int] | None,
+        regeneration: dict[str, Any] | None,
+    ) -> None:
+        sample_seed = seeds["sample_seed"] if seeds else secrets.randbelow(MAX_SAMPLE_SEED + 1)
+        prompt_seed = (
+            seeds["prompt_seed"]
+            if seeds
+            else regeneration.get("prompt_seed")
+            if regeneration and regeneration.get("mode") == "prompt_variant"
+            else secrets.randbelow(2**31)
+        )
+        date_folder = datetime.now().strftime("%Y-%m-%d")
+        worker_index = self.active_clients.index(client)
+        prefix = f"AnimaRandom/{date_folder}/{batch_id}/worker-{worker_index}/image"
+        # ImageVault removes empty output directories after encrypting an image.
+        # Give each ComfyUI process its own leaf directory and recreate it before
+        # every submission, so one worker cannot remove another worker's target
+        # while both are saving in parallel.
+        output_dir = getattr(self.image_vault, "output_dir", None)
+        if output_dir is not None:
+            (Path(output_dir) / Path(prefix).parent).mkdir(parents=True, exist_ok=True)
+        resolved = self._resolve_regeneration(settings, prompt_seed, regeneration) if regeneration else (
+            self.catalog.resolve_prompt(settings, prompt_seed) if self.catalog else {
+                "composer_prompt": "",
+                "full_prompt": "",
+                "selected": {},
+            }
+        )
+        if regeneration and regeneration.get("mode") == "content_redraw":
+            for attempt in range(512):
+                candidate_seed = (prompt_seed + attempt) % (2**31)
+                resolved = self._resolve_regeneration(settings, candidate_seed, regeneration)
+                if resolved.pop("_changed", False):
+                    prompt_seed = candidate_seed
+                    break
+            else:
+                raise WorkflowError("所选维度无可用替代组合")
+        if self.prompt_rules is not None and not (
+            regeneration and regeneration.get("frozen_positive_prompt")
+        ):
+            protected = settings.get("lora_managed_triggers", [])
+            composer_prompt, _ = self.prompt_rules.normalize_text(
+                resolved["composer_prompt"], "positive", protected_lora_words=protected
+            )
+            full_prompt, _ = self.prompt_rules.normalize_text(
+                resolved["full_prompt"], "positive", protected_lora_words=protected
+            )
+            resolved = {**resolved, "composer_prompt": composer_prompt, "full_prompt": full_prompt}
+
+        submission_args = (settings, sample_seed, prompt_seed, prefix, client_id, sequence)
+        if self.catalog:
+            payload = self.templates.submission(
+                *submission_args,
+                resolved_prompt=resolved["composer_prompt"],
+                resolved_selection=resolved["selected"],
+                resolved_prompt_full=resolved["full_prompt"],
+                frozen_positive_prompt=(regeneration or {}).get("frozen_positive_prompt", ""),
+                frozen_negative_prompt=(regeneration or {}).get("frozen_negative_prompt", ""),
+            )
+        else:
+            payload = self.templates.submission(*submission_args)
+
+        prompt_id = await client.submit(payload)
+        self.state["prompt_id"] = prompt_id
+        worker_state = self.state["gpu_workers"][worker_index]
+        worker_state["status"] = "generating"
+        try:
+            entry = await client.wait_for_history(
+                prompt_id, should_abort=lambda: self.stop_requested
+            )
+        except ComfyAborted:
+            await self._interrupt_current(client)
+            raise
+        images = extract_images(entry)
+        if not images:
+            raise ComfyError("任务完成但未返回保存图片")
+        frozen_positive = (regeneration or {}).get("frozen_positive_prompt", "")
+        frozen_negative = (regeneration or {}).get("frozen_negative_prompt", "")
+        positive = frozen_positive or extract_positive_prompt(entry)
+        for image in images:
+            stored_image = (
+                self.image_vault.encrypt_output(image)
+                if self.image_vault is not None
+                else image
+            )
+            await self.history.add_image(
+                batch_id=batch_id,
+                sequence=sequence,
+                prompt_id=prompt_id,
+                image=stored_image,
+                positive_prompt=positive,
+                negative_prompt=frozen_negative or settings["negative_prompt"],
+                sample_seed=sample_seed,
+                prompt_seed=prompt_seed,
+                settings=settings,
+                resolved_selection=resolved["selected"],
+                resolved_prompt=positive or resolved["full_prompt"],
+            )
+        async with self._history_update_lock:
+            self.state["completed"] += 1
+            await self.history.update_batch(batch_id, completed=self.state["completed"])
+
+    async def _advance_queue(self) -> None:
+        """当前批次收尾后自动接续队列中的下一个;关闭时不再接续。
+
+        stop_requested 只作用于当前批次:clearQueue=true 的停止已经清空了队列,
+        clearQueue=false(只停当前)则应继续接续,_begin_batch 会复位该标志。
+        """
+        if self.shutting_down or not self.queue:
+            self._stop_monitor()
+            return
+        entry = self.queue.pop(0)
+        try:
+            await self._begin_batch(
+                entry["settings"],
+                entry["seeds"],
+                entry.get("regeneration"),
+                entry.get("clients"),
+                entry.get("warnings"),
+            )
+        except Exception as error:  # 接续失败不应吞掉:记录并继续尝试下一个
+            logger.warning("队列批次启动失败: %s", error)
+            await self._advance_queue()
+
+    def _ensure_monitors(self) -> None:
+        self._stop_monitor()
+        for index, (client, client_id) in enumerate(zip(self.active_clients, self.client_ids)):
+            if getattr(client, "progress_stream", None) is not None:
+                self._monitor_tasks.append(
+                    asyncio.create_task(self._monitor_progress(index, client, client_id))
+                )
+
+    def _stop_monitor(self) -> None:
+        for task in self._monitor_tasks:
+            if not task.done():
+                task.cancel()
+        self._monitor_tasks = []
+
+    async def _monitor_progress(self, worker_index: int, client: Any, client_id: str) -> None:
+        """通过 ComfyUI websocket 更新采样进度与实时预览。
+
+        尽力而为:连接失败或断开只影响进度展示,不影响批次本身
+        (批次完成仍由 wait_for_history 轮询判定)。
+        """
+        while self.active():
+            try:
+                async for item in client.progress_stream(client_id):
+                    state = self.state
+                    if state is None or state.get("status") not in ("running", "stopping"):
+                        continue
+                    if item.get("kind") == "event":
+                        payload = item.get("payload") or {}
+                        data = payload.get("data") or {}
+                        if payload.get("type") == "progress":
+                            self._worker_progress[worker_index] = {
+                                "value": int(data.get("value") or 0),
+                                "max": int(data.get("max") or 0),
+                            }
+                            self._update_aggregate_progress()
+                        elif payload.get("type") == "executing":
+                            if data.get("node") is None:
+                                self._worker_progress[worker_index] = None
+                                self._update_aggregate_progress()
+                    elif item.get("kind") == "preview":
+                        self._preview_seq += 1
+                        self.preview = (
+                            self._preview_seq,
+                            f"image/{item.get('format') or 'jpeg'}",
+                            item.get("bytes") or b"",
+                        )
+                        state["preview_id"] = self._preview_seq
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.debug("进度 websocket 中断,稍后重连: %s", error)
+            if not self.active():
+                break
+            await asyncio.sleep(2.0)
+
+    def _update_aggregate_progress(self) -> None:
+        if self.state is None:
+            return
+        active = [item for item in self._worker_progress if item and item.get("max", 0) > 0]
+        if active:
+            self.state["progress"] = {
+                "value": sum(item["value"] for item in active),
+                "max": sum(item["max"] for item in active),
+            }
+        else:
+            self.state.pop("progress", None)
+
+    async def _interrupt_current(self, client: Any | None = None) -> None:
+        """停止时尽力中断 ComfyUI 正在渲染的任务;失败不影响批次收尾。"""
+        interrupt = getattr(client or self.comfy, "interrupt", None)
+        if interrupt is None:
+            return
+        try:
+            await interrupt()
+        except ComfyError:
+            pass
+
+    def _resolve_regeneration(
+        self,
+        settings: dict[str, Any],
+        prompt_seed: int,
+        regeneration: dict[str, Any],
+    ) -> dict[str, Any]:
+        mode = regeneration["mode"]
+        fixed_selection = copy.deepcopy(regeneration.get("fixed_selection") or {})
+        if mode in {"replay", "prompt_variant"}:
+            positive = regeneration["frozen_positive_prompt"]
+            return {
+                "composer_prompt": positive,
+                "full_prompt": positive,
+                "selected": fixed_selection,
+            }
+        if mode == "settings_reroll":
+            return self.catalog.resolve_prompt(settings, prompt_seed) if self.catalog else {
+                "composer_prompt": "",
+                "full_prompt": "",
+                "selected": {},
+            }
+        if not self.catalog:
+            raise WorkflowError("当前提示词目录不可用，无法重新抽取内容")
+        redraw_settings = copy.deepcopy(settings)
+        for section, entries in fixed_selection.items():
+            redraw_settings[f"random_{section}"] = False
+            parts: list[str] = []
+            for item in entries:
+                parts.extend(
+                    self.catalog.prompt_parts(
+                        item,
+                        section,
+                        settings.get("character_detail", "trigger_tags"),
+                        bool(settings.get("female_count") or settings.get("male_count"))
+                        and section == "character",
+                    )
+                )
+            redraw_settings[f"fixed_{section}"] = ", ".join(parts)
+        resolved = self.catalog.resolve_prompt(redraw_settings, prompt_seed)
+        merged = copy.deepcopy(resolved["selected"])
+        for section, entries in fixed_selection.items():
+            merged[section] = copy.deepcopy(entries)
+        redraw_sections = regeneration["redraw_sections"]
+        original = regeneration.get("original_selection") or {}
+        changed = any(
+            [item.get("id") for item in merged.get(section, [])]
+            != [item.get("id") for item in original.get(section, [])]
+            for section in redraw_sections
+        )
+        return {**resolved, "selected": merged, "_changed": changed}

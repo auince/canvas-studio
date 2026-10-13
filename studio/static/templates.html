@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101923">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' blob: data:; style-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'">
+  <title>模板库 · Canvas Studio</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/templates.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">✦</span><span>Canvas <em>Studio</em></span></div>
+      <span class="topbar-caption">选择一个起点，再自由调整</span>
+      <nav class="topbar-nav" aria-label="页面导航"><a href="/">创作</a><a href="/prompts">提示词库</a><a href="/templates" class="active">模板库</a><a href="/random/">随机工坊</a></nav>
+      <div class="topbar-right"><span class="service-dot"></span><span>本机模型模板</span></div>
+    </header>
+    <main class="template-page">
+      <div class="template-head"><div><span class="eyebrow">LIBRARY / 02</span><h1>工作流模板<span class="accent-period">.</span></h1><p>从已安装的 ComfyUI 官方模板和当前服务器的工作流中挑一个起点。选中后可在统一界面继续修改模型、LoRA、提示词和采样参数。</p></div></div>
+      <div id="templateGrid" class="template-grid" aria-live="polite"></div>
+      <p id="templateStatus" class="status"></p>
+      <p class="source-note">模板来源包括 <a href="https://github.com/Comfy-Org/workflow_templates" target="_blank" rel="noopener noreferrer">Comfy 官方工作流仓库</a>及当前服务器工作流。卡片标记“可运行”时，所需模型和 LoRA 均已在本机找到；原始 ComfyUI 模板可从卡片下载。</p>
+    </main>
+  </div>
+</body>
+</html>

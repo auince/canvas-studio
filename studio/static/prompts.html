@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101923">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' blob: data:; style-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'">
+  <title>提示词库 · Canvas Studio</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/prompts.css">
+  <script src="/prompts.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">✦</span><span>Canvas <em>Studio</em></span></div>
+      <span class="topbar-caption">从灵感到可执行提示词</span>
+      <nav class="topbar-nav" aria-label="页面导航"><a href="/">创作</a><a href="/prompts" class="active">提示词库</a><a href="/templates">模板库</a><a href="/random/">随机工坊</a></nav>
+      <div class="topbar-right"><span class="service-dot"></span><span>本地精选</span></div>
+    </header>
+    <main class="prompt-page">
+      <div class="template-head"><div><span class="eyebrow">PROMPTS / 03</span><h1>提示词库<span class="accent-period">.</span></h1><p>Anima 用标签逐层搭建画面；Krea 2 用可填写的自然语言模板。选好后带回创作页，随时可以再改。</p><p id="libraryCounts" class="library-counts">正在载入词库…</p></div></div>
+      <div class="prompt-family-switch" role="group" aria-label="提示词模式">
+        <button type="button" id="animaTab" class="selected" aria-pressed="true">Anima · 标签组合</button>
+        <button type="button" id="kreaTab" aria-pressed="false">Krea 2 · 场景模板</button>
+      </div>
+      <div class="prompt-layout">
+        <section class="prompt-browser" aria-label="提示词条目">
+          <label class="field prompt-search"><span>搜索标签或模板</span><input id="promptSearch" type="search" placeholder="输入中文名称或英文关键词"></label>
+          <div id="animaPanel">
+            <p class="prompt-help">先写主体，再选外观、服饰、场景和光线。互相矛盾的标签会降低稳定性。</p>
+            <div id="tagCategories" class="prompt-categories"></div>
+            <p id="tagCount" class="library-list-count"></p>
+            <div id="tagGrid" class="tag-grid"></div>
+            <button id="moreTags" type="button" class="library-more" hidden>显示更多标签</button>
+          </div>
+          <div id="kreaPanel" hidden>
+            <p class="prompt-help">选择题材模板后，在右侧填写对应字段。源仓库的示例曾用 Krea 2 Turbo 出图；本站只引用提示词，不引入示例图。生成效果仍会受到本地模型和参数影响。</p>
+            <div id="templateCategories" class="prompt-categories"></div>
+            <p id="templateCount" class="library-list-count"></p>
+            <div id="templateChoices" class="prompt-template-grid"></div>
+            <button id="moreTemplates" type="button" class="library-more" hidden>显示更多模板</button>
+          </div>
+        </section>
+        <aside class="prompt-composer" aria-label="提示词编辑器">
+          <span class="eyebrow">COMPOSE / LIVE</span><h2>组合预览</h2>
+          <div id="animaFields"><label class="field"><span>主体与独特细节 <small>例如：成年女性剑士，手持旧地图</small></span><textarea id="animaSubject" rows="3" maxlength="2000" placeholder="在这里描述人物或画面的核心内容"></textarea></label></div>
+          <div id="kreaFields" hidden>
+            <label class="field"><span>主体 <small>必填：谁或什么是画面焦点</small></span><input id="kreaSubject" maxlength="1000" placeholder="例如：a ceramic vase with blue patterns"></label>
+            <label id="settingField" class="field"><span>环境 <small>在哪里</small></span><input id="kreaSetting" maxlength="1000"></label>
+            <label id="lightingField" class="field"><span>光线 <small>光源与氛围</small></span><input id="kreaLighting" maxlength="1000"></label>
+            <label id="styleField" class="field"><span>表现风格 <small>摄影、插画或设计风格</small></span><input id="kreaStyle" maxlength="1000"></label>
+          </div>
+          <label class="field"><span>最终提示词 <small>可直接在这里修改，套用的是当前文本</small></span><textarea id="composedPrompt" rows="9" maxlength="12000" placeholder="选择标签或模板后会显示在这里"></textarea></label>
+          <p id="promptLibraryStatus" class="prompt-help" role="status" aria-live="polite"></p>
+          <button id="applyPrompt" type="button" class="primary-button prompt-apply">带到创作页 ↗</button>
+        </aside>
+      </div>
+      <p class="source-note">新增标签词汇取自 <a href="https://github.com/PYU224/tagdb-updater" target="_blank" rel="noopener noreferrer">tagdb-updater</a> 的通用标签 CSV，中文说明由本站编写；新增模板改编自 <a href="https://github.com/sjh9714/krea2-wildcards" target="_blank" rel="noopener noreferrer">krea2-wildcards</a> 的 Krea 2 实测提示词。原有少量条目仍参考 <a href="https://github.com/wfjsw/danbooru-diffusion-prompt-builder" target="_blank" rel="noopener noreferrer">Danbooru 标签超市</a>与 <a href="https://github.com/Dalabad/stable-diffusion-prompt-templates" target="_blank" rel="noopener noreferrer">Stable Diffusion Prompt Templates</a> 的组织方式。<a href="/prompt-licenses.txt" target="_blank" rel="noopener noreferrer">查看 MIT 授权与署名</a>。提示词效果取决于模型、LoRA 和参数。</p>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,1193 @@
+from __future__ import annotations
+
+import copy
+import json
+import math
+import re
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_QUALITY = ""
+DEFAULT_NEGATIVE = ""
+DEFAULT_LORAS: list[dict[str, Any]] = []
+# Model resources are selected from the ComfyUI inventory at runtime.
+DEFAULT_MODEL = "select-a-model"
+DEFAULT_SAMPLER = "er_sde"
+DEFAULT_SCHEDULER = "simple"
+DEFAULT_SECOND_SAMPLER = {
+    "enabled": False,
+    "steps": 16,
+    "cfg": 4.0,
+    "sampler_name": DEFAULT_SAMPLER,
+    "scheduler": DEFAULT_SCHEDULER,
+    "denoise": 0.2,
+}
+DEFAULT_HIRES = {
+    # Keep optional high-resolution generation disabled until a model is selected.
+    "enabled": False,
+    "model_name": "",
+    "percent": 45,
+}
+DEFAULT_DETAILERS = {
+    "hand": False,
+    "nsfw": False,
+    "face": False,
+    "eyes": False,
+}
+DETAILER_ORDER = tuple(DEFAULT_DETAILERS)
+DETAILER_NODES = {
+    "hand": {"detector": 8, "editor": 13, "detailer": 27, "detector_input": "bbox_detector"},
+    # This model is a segmentation detector and must use the optional
+    # SEGM_DETECTOR input on EditDetailerPipe.
+    "nsfw": {
+        "detector": 9,
+        "editor": 14,
+        "detailer": 28,
+        "detector_input": "segm_detector",
+        # UltralyticsDetectorProvider exposes BBOX_DETECTOR at output 0 and
+        # SEGM_DETECTOR at output 1.
+        "detector_output": 1,
+    },
+    "face": {"detector": 10, "editor": 15, "detailer": 29, "detector_input": "bbox_detector"},
+    "eyes": {"detector": 11, "editor": 16, "detailer": 30, "detector_input": "bbox_detector"},
+}
+MAX_LORAS = 64
+MAX_LORA_MANAGED_TRIGGERS = 256
+MIN_LORA_STRENGTH = -100.0
+MAX_LORA_STRENGTH = 100.0
+PROMPT_SECTIONS = ("character", "clothing", "pose", "background", "expression")
+DEFAULT_SETTINGS = {
+    "count": 10,
+    "random_character": False,
+    "random_clothing": False,
+    "random_pose": False,
+    "random_background": False,
+    "random_expression": False,
+    "random_character_count": 1,
+    "random_clothing_count": 1,
+    "random_pose_count": 1,
+    "random_background_count": 1,
+    "random_expression_count": 1,
+    "fixed_character": "",
+    "fixed_clothing": "",
+    "fixed_pose": "",
+    "fixed_background": "",
+    "fixed_expression": "",
+    "female_count": 1,
+    "male_count": 0,
+    "model_name": DEFAULT_MODEL,
+    "loras": DEFAULT_LORAS,
+    "lora_managed_triggers": [],
+    "hires": DEFAULT_HIRES,
+    "detailers": DEFAULT_DETAILERS,
+    "pools": {
+        "character": {"mode": "include", "ids": [], "excluded_ids": []},
+        "clothing": {"mode": "include", "ids": [], "excluded_ids": []},
+        "pose": {"mode": "include", "ids": [], "excluded_ids": []},
+        "background": {"mode": "include", "ids": [], "excluded_ids": []},
+        "expression": {"mode": "include", "ids": [], "excluded_ids": []},
+    },
+    "character_detail": "trigger_tags",
+    "manual_artist": "",
+    "quality_prompt": DEFAULT_QUALITY,
+    "extra_prompt": "",
+    "negative_prompt": DEFAULT_NEGATIVE,
+    "width": 832,
+    "height": 1216,
+    "steps": 30,
+    "cfg": 4.0,
+    "sampler_name": DEFAULT_SAMPLER,
+    "scheduler": DEFAULT_SCHEDULER,
+    "cfg_zero_star": False,
+    "second_sampler": DEFAULT_SECOND_SAMPLER,
+}
+
+MAX_SAMPLE_SEED = 1125899906842624
+
+COMPOSER_ID = 60
+POSITIVE_ID = 42
+NEGATIVE_ID = 45
+HIRES_SCALE_ID = 51
+HIRES_MODEL_ID = 61
+HIRES_UPSCALE_ID = 62
+CFG_ZERO_STAR_ID = 49
+SECOND_SAMPLER_ID = 25
+SAM_LOADER_ID = 7
+DETAILER_PIPE_ID = 18
+REMOVED_NODE_IDS = {3, 4}
+
+# 模板必需节点总表:构造 WorkflowTemplates 时一次性校验。
+# 工作流重新导出会导致节点重编号,缺失节点应在启动时给出明确错误,
+# 而不是运行期抛出晦涩的 KeyError/IndexError。
+REQUIRED_API_NODES: dict[int, str] = {
+    1: "UNETLoader 主模型",
+    2: "Power LoRA Loader",
+    5: "KSampler 主采样器",
+    12: "SaveImage 保存图像",
+    22: "VAE 解码",
+    23: "宽度",
+    31: "高度",
+    35: "批量数量",
+    37: "种子",
+    39: "步数",
+    41: "CFG",
+    POSITIVE_ID: "正向提示词",
+    NEGATIVE_ID: "负向提示词",
+    HIRES_SCALE_ID: "高清修复缩放",
+    HIRES_MODEL_ID: "高清修复模型加载",
+    HIRES_UPSCALE_ID: "高清修复放大",
+    COMPOSER_ID: "Anima 提示词合成器",
+}
+_DETAILER_LABELS = {"hand": "手部", "nsfw": "NSFW", "face": "面部", "eyes": "眼睛"}
+REQUIRED_UI_NODES: dict[int, str] = dict(REQUIRED_API_NODES)
+for _detailer_name, _detailer_nodes in DETAILER_NODES.items():
+    _label = _DETAILER_LABELS[_detailer_name]
+    REQUIRED_UI_NODES[_detailer_nodes["detector"]] = f"{_label} Detailer 检测器"
+    REQUIRED_UI_NODES[_detailer_nodes["editor"]] = f"{_label} Detailer 编辑管线"
+    REQUIRED_UI_NODES[_detailer_nodes["detailer"]] = f"{_label} Detailer"
+
+
+def validate_template_nodes(api: dict[str, Any], ui: dict[str, Any]) -> None:
+    """校验两份模板包含全部必需节点,缺失时给出可行动的错误信息。"""
+    missing_api = [
+        f"{node_id}({label})"
+        for node_id, label in sorted(REQUIRED_API_NODES.items())
+        if str(node_id) not in api
+    ]
+    ui_ids = {node.get("id") for node in ui.get("nodes") or []}
+    missing_ui = [
+        f"{node_id}({label})"
+        for node_id, label in sorted(REQUIRED_UI_NODES.items())
+        if node_id not in ui_ids
+    ]
+    problems = []
+    if missing_api:
+        problems.append(f"API 模板缺少节点 {', '.join(missing_api)}")
+    if missing_ui:
+        problems.append(f"可视化模板缺少节点 {', '.join(missing_ui)}")
+    if problems:
+        raise WorkflowError(
+            "工作流模板与预期结构不符(可能因重新导出导致节点重编号): " + "；".join(problems)
+        )
+
+
+class WorkflowError(ValueError):
+    pass
+
+
+def read_json(path: str | Path) -> dict[str, Any]:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_json(path: str | Path, value: dict[str, Any]) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(value, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+
+
+def _integer(name: str, value: Any, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise WorkflowError(f"{name} 必须是整数")
+    if not minimum <= value <= maximum:
+        raise WorkflowError(f"{name} 必须在 {minimum}-{maximum} 之间")
+    return value
+
+
+def _boolean(name: str, value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise WorkflowError(f"{name} 必须是布尔值")
+    return value
+
+
+def _text(name: str, value: Any) -> str:
+    if not isinstance(value, str):
+        raise WorkflowError(f"{name} 必须是字符串")
+    if len(value) > 20000:
+        raise WorkflowError(f"{name} 不能超过 20000 个字符")
+    return value.strip()
+
+
+def normalize_lora_path(value: Any) -> str:
+    filename = _text("LoRA 文件名", value).replace("\\", "/")
+    parts = filename.split("/")
+    if (
+        not filename
+        or filename.startswith("/")
+        or len(filename) >= 2 and filename[1] == ":"
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise WorkflowError("LoRA 文件名必须是安全的相对路径")
+    return "/".join(parts)
+
+
+def normalize_artist_tags(value: Any) -> str:
+    raw = _text("manual_artist", value).replace("\r", ",").replace("\n", ",")
+    names: list[str] = []
+    seen: set[str] = set()
+    for part in re.split(r",|(?=@)", raw):
+        name = part.strip()
+        if name.startswith("@"):
+            name = name[1:].strip()
+        elif name.lower().startswith("by "):
+            name = name[3:].strip()
+        if not name:
+            continue
+        identity = name.casefold()
+        if identity not in seen:
+            names.append(name)
+            seen.add(identity)
+    return ", ".join(f"@{name}" for name in names)
+
+
+def _normalize_loras(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise WorkflowError("loras 必须是数组")
+    if len(value) > MAX_LORAS:
+        raise WorkflowError(f"LoRA 配置不能超过 {MAX_LORAS} 项")
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value, 1):
+        if not isinstance(item, dict):
+            raise WorkflowError(f"loras[{index}] 必须是对象")
+        filename = normalize_lora_path(item.get("filename"))
+        identity = filename.casefold()
+        if identity in seen:
+            raise WorkflowError(f"LoRA 不能重复配置: {filename}")
+        seen.add(identity)
+        enabled = _boolean(f"loras[{index}].enabled", item.get("enabled"))
+        strength = item.get("strength")
+        if isinstance(strength, bool) or not isinstance(strength, (int, float)):
+            raise WorkflowError(f"loras[{index}].strength 必须是数字")
+        if not math.isfinite(float(strength)):
+            raise WorkflowError(f"loras[{index}].strength 必须是有限数字")
+        strength = float(strength)
+        if not MIN_LORA_STRENGTH <= strength <= MAX_LORA_STRENGTH:
+            raise WorkflowError(
+                f"loras[{index}].strength 必须在 {MIN_LORA_STRENGTH:g}-{MAX_LORA_STRENGTH:g} 之间"
+            )
+        result.append({"filename": filename, "enabled": enabled, "strength": strength})
+    return result
+
+
+def validate_loras(settings: dict[str, Any], available_filenames: Any | None = None) -> list[dict[str, Any]]:
+    """Validate the persisted LoRA shape and, when available, the ComfyUI inventory."""
+    loras = _normalize_loras(settings.get("loras", DEFAULT_LORAS))
+    if available_filenames is not None:
+        available: dict[str, str] = {}
+        by_basename: dict[str, list[str]] = {}
+        for raw in available_filenames:
+            exact = str(raw)
+            normalized = normalize_lora_path(exact)
+            available.setdefault(normalized.casefold(), exact)
+            by_basename.setdefault(normalized.rsplit("/", 1)[-1].casefold(), []).append(exact)
+        for item in loras:
+            if not item["enabled"]:
+                continue
+            normalized = normalize_lora_path(item["filename"])
+            exact = available.get(normalized.casefold())
+            if exact is None and "/" not in normalized:
+                matches = list(dict.fromkeys(by_basename.get(normalized.casefold(), [])))
+                if len(matches) == 1:
+                    exact = matches[0]
+                elif len(matches) > 1:
+                    raise WorkflowError(
+                        f"LoRA 文件名存在多个子目录匹配，请重新选择: {item['filename']}"
+                    )
+            if exact is None:
+                raise WorkflowError(f"LoRA 文件不存在: {item['filename']}")
+            item["filename"] = exact
+    return loras
+
+
+def _normalize_managed_triggers(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        raise WorkflowError("lora_managed_triggers 必须是数组")
+    if len(value) > MAX_LORA_MANAGED_TRIGGERS:
+        raise WorkflowError(
+            f"lora_managed_triggers 不能超过 {MAX_LORA_MANAGED_TRIGGERS} 项"
+        )
+    result: list[str] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(value):
+        word = _text(f"lora_managed_triggers[{index}]", raw)
+        if len(word) > 500:
+            raise WorkflowError(f"lora_managed_triggers[{index}] 过长")
+        identity = word.casefold()
+        if word and identity not in seen:
+            result.append(word)
+            seen.add(identity)
+    return result
+
+
+def _validate_hires(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise WorkflowError("hires 必须是对象")
+    unknown = set(value) - set(DEFAULT_HIRES)
+    if unknown:
+        raise WorkflowError(f"未知高清修复参数: {', '.join(sorted(unknown))}")
+    merged = {**DEFAULT_HIRES, **value}
+    return {
+        "enabled": _boolean("hires.enabled", merged["enabled"]),
+        "model_name": _text("hires.model_name", merged["model_name"]),
+        "percent": _integer("hires.percent", merged["percent"], 1, 1000),
+    }
+
+
+def _validate_detailers(value: Any) -> dict[str, bool]:
+    if not isinstance(value, dict):
+        raise WorkflowError("detailers 必须是对象")
+    unknown = set(value) - set(DEFAULT_DETAILERS)
+    if unknown:
+        raise WorkflowError(f"未知细节修复模块: {', '.join(sorted(unknown))}")
+    merged = {**DEFAULT_DETAILERS, **value}
+    return {name: _boolean(f"detailers.{name}", merged[name]) for name in DETAILER_ORDER}
+
+
+def _validate_second_sampler(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise WorkflowError("second_sampler 必须是对象")
+    unknown = set(value) - set(DEFAULT_SECOND_SAMPLER)
+    if unknown:
+        raise WorkflowError(f"未知二次采样参数: {', '.join(sorted(unknown))}")
+    merged = {**DEFAULT_SECOND_SAMPLER, **value}
+    enabled = _boolean("second_sampler.enabled", merged["enabled"])
+    steps = _integer("second_sampler.steps", merged["steps"], 1, 150)
+    cfg = merged["cfg"]
+    if isinstance(cfg, bool) or not isinstance(cfg, (int, float)):
+        raise WorkflowError("second_sampler.cfg 必须是数字")
+    if not math.isfinite(float(cfg)):
+        raise WorkflowError("second_sampler.cfg 必须是有限数字")
+    cfg = float(cfg)
+    if not 0.1 <= cfg <= 30:
+        raise WorkflowError("second_sampler.cfg 必须在 0.1-30 之间")
+    sampler_name = _text("second_sampler.sampler_name", merged["sampler_name"])
+    scheduler = _text("second_sampler.scheduler", merged["scheduler"])
+    if not sampler_name:
+        raise WorkflowError("second_sampler.sampler_name 不能为空")
+    if not scheduler:
+        raise WorkflowError("second_sampler.scheduler 不能为空")
+    denoise = merged["denoise"]
+    if isinstance(denoise, bool) or not isinstance(denoise, (int, float)):
+        raise WorkflowError("second_sampler.denoise 必须是数字")
+    if not math.isfinite(float(denoise)):
+        raise WorkflowError("second_sampler.denoise 必须是有限数字")
+    denoise = float(denoise)
+    if not 0 <= denoise <= 1:
+        raise WorkflowError("second_sampler.denoise 必须在 0-1 之间")
+    return {
+        "enabled": enabled,
+        "steps": steps,
+        "cfg": cfg,
+        "sampler_name": sampler_name,
+        "scheduler": scheduler,
+        "denoise": denoise,
+    }
+
+
+def validate_settings(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    overrides = overrides or {}
+    unknown = set(overrides) - set(DEFAULT_SETTINGS)
+    if unknown:
+        raise WorkflowError(f"未知参数: {', '.join(sorted(unknown))}")
+
+    legacy_pools = "pools" not in overrides and any(overrides.get(f"random_{section}") for section in PROMPT_SECTIONS)
+    settings = copy.deepcopy(DEFAULT_SETTINGS)
+    settings.update(overrides)
+    settings["count"] = _integer("生成数量", settings["count"], 1, 1000)
+    for name in tuple(f"random_{section}" for section in PROMPT_SECTIONS):
+        settings[name] = _boolean(name, settings[name])
+    for name in tuple(f"random_{section}_count" for section in PROMPT_SECTIONS):
+        settings[name] = _integer(name, settings[name], 1, 5)
+    if settings["random_expression_count"] != 1:
+        raise WorkflowError("表情随机池每张只能抽取 1 项")
+    settings["female_count"] = _integer("女性人数", settings["female_count"], 0, 5)
+    settings["male_count"] = _integer("男性人数", settings["male_count"], 0, 5)
+    total_people = settings["female_count"] + settings["male_count"]
+    if total_people > 5:
+        raise WorkflowError("画面总人数不能超过 5")
+    if settings["random_character"] and total_people and settings["random_character_count"] > total_people:
+        raise WorkflowError("指定角色数不能超过画面总人数")
+
+    pools = settings.get("pools")
+    if legacy_pools:
+        pools = {
+            section: {"mode": "all", "ids": [], "excluded_ids": []}
+            for section in PROMPT_SECTIONS
+        }
+    if not isinstance(pools, dict):
+        raise WorkflowError("pools 必须是对象")
+    normalized_pools = {}
+    for section in PROMPT_SECTIONS:
+        selection = pools.get(section, {})
+        if not isinstance(selection, dict):
+            raise WorkflowError(f"{section} 随机池设置无效")
+        mode = selection.get("mode", "include")
+        if mode not in {"include", "all"}:
+            raise WorkflowError(f"{section} 随机池模式无效")
+        ids = selection.get("ids", [])
+        excluded_ids = selection.get("excluded_ids", [])
+        if not isinstance(ids, list) or not isinstance(excluded_ids, list):
+            raise WorkflowError(f"{section} 随机池条目必须是数组")
+        if len(ids) > 50000 or len(excluded_ids) > 50000:
+            raise WorkflowError(f"{section} 随机池条目过多")
+        normalized_pools[section] = {
+            "mode": mode,
+            "ids": list(dict.fromkeys(_text(f"{section} 条目", value) for value in ids)),
+            "excluded_ids": list(dict.fromkeys(_text(f"{section} 排除条目", value) for value in excluded_ids)),
+        }
+    settings["pools"] = normalized_pools
+    settings["model_name"] = _text("model_name", settings["model_name"])
+    if not settings["model_name"]:
+        raise WorkflowError("model_name 不能为空")
+    settings["loras"] = validate_loras(settings)
+    settings["lora_managed_triggers"] = _normalize_managed_triggers(
+        settings["lora_managed_triggers"]
+    )
+    settings["hires"] = _validate_hires(settings["hires"])
+    settings["detailers"] = _validate_detailers(settings["detailers"])
+    settings["cfg_zero_star"] = _boolean("cfg_zero_star", settings["cfg_zero_star"])
+    settings["second_sampler"] = _validate_second_sampler(settings["second_sampler"])
+
+    if settings["character_detail"] not in {"trigger", "trigger_tags"}:
+        raise WorkflowError("character_detail 必须是 trigger 或 trigger_tags")
+
+    settings["manual_artist"] = normalize_artist_tags(settings["manual_artist"])
+    for name in (
+        "fixed_character",
+        "fixed_clothing",
+        "fixed_pose",
+        "fixed_background",
+        "fixed_expression",
+        "quality_prompt",
+        "extra_prompt",
+        "negative_prompt",
+    ):
+        settings[name] = _text(name, settings[name])
+
+    for name in ("width", "height"):
+        settings[name] = _integer(name, settings[name], 64, 4096)
+        if settings[name] % 8:
+            raise WorkflowError(f"{name} 必须能被 8 整除")
+
+    settings["steps"] = _integer("steps", settings["steps"], 1, 150)
+    if isinstance(settings["cfg"], bool) or not isinstance(settings["cfg"], (int, float)):
+        raise WorkflowError("cfg 必须是数字")
+    settings["cfg"] = float(settings["cfg"])
+    if not 0.1 <= settings["cfg"] <= 30:
+        raise WorkflowError("cfg 必须在 0.1-30 之间")
+    settings["sampler_name"] = _text("sampler_name", settings["sampler_name"])
+    settings["scheduler"] = _text("scheduler", settings["scheduler"])
+    if not settings["sampler_name"]:
+        raise WorkflowError("sampler_name 不能为空")
+    if not settings["scheduler"]:
+        raise WorkflowError("scheduler 不能为空")
+    return settings
+
+
+def _api_composer() -> dict[str, Any]:
+    return {
+        "inputs": {
+            "enable_artist": False,
+            "enable_character": True,
+            "enable_clothing": True,
+            "enable_background": True,
+            "enable_pose": True,
+            "character_detail": "trigger_tags",
+            "seed": -1,
+            "artist_count": 0,
+            "preview_collapsed": False,
+            "resolved_prompt": "",
+            "character_count": 1,
+            "clothing_count": 1,
+            "pose_count": 1,
+            "background_count": 1,
+            "extra_prompt": "",
+        },
+        "class_type": "AnimaPromptComposer",
+        "_meta": {"title": "Anima Prompt Random Draw"},
+    }
+
+
+def _visual_composer(link_id: int) -> dict[str, Any]:
+    return {
+        "id": COMPOSER_ID,
+        "type": "AnimaPromptComposer",
+        "pos": [1035, 95],
+        "size": [420, 430],
+        "flags": {},
+        "order": 25,
+        "mode": 0,
+        "inputs": [],
+        "outputs": [{"name": "text", "type": "STRING", "slot_index": 0, "links": [link_id]}],
+        "properties": {
+            "Node name for S&R": "AnimaPromptComposer",
+            "cnr_id": "Comfyui-Anima-Tools",
+        },
+        "widgets_values": [False, True, True, True, True, "trigger_tags", -1, 0, False, "", 1, 1, 1, 1, ""],
+        "title": "随机角色 / 服装 / 姿势 / 背景",
+        "color": "#253b36",
+        "bgcolor": "#35534b",
+    }
+
+
+def _remove_visual_nodes(workflow: dict[str, Any]) -> set[int]:
+    workflow["nodes"] = [node for node in workflow["nodes"] if node.get("id") not in REMOVED_NODE_IDS]
+    removed_links = {
+        int(link[0])
+        for link in workflow.get("links", [])
+        if int(link[1]) in REMOVED_NODE_IDS or int(link[3]) in REMOVED_NODE_IDS
+    }
+    workflow["links"] = [link for link in workflow.get("links", []) if int(link[0]) not in removed_links]
+    for node in workflow["nodes"]:
+        for input_value in node.get("inputs", []):
+            if input_value.get("link") in removed_links:
+                input_value["link"] = None
+        for output in node.get("outputs", []):
+            links = output.get("links")
+            if isinstance(links, list):
+                output["links"] = [link_id for link_id in links if link_id not in removed_links] or None
+    return removed_links
+
+
+def _visual_node(workflow: dict[str, Any], node_id: int) -> dict[str, Any]:
+    for node in workflow["nodes"]:
+        if int(node.get("id")) == node_id:
+            return node
+    raise WorkflowError(f"工作流缺少节点 {node_id}")
+
+
+def _prepare_hires_nodes(api: dict[str, Any], ui: dict[str, Any]) -> None:
+    existing = api.get(str(HIRES_SCALE_ID), {})
+    existing_inputs = existing.get("inputs", {})
+    if existing.get("class_type") == "ImageScaleBy":
+        model_name = api.get(str(HIRES_MODEL_ID), {}).get("inputs", {}).get(
+            "model_name", DEFAULT_HIRES["model_name"]
+        )
+        percent = round(float(existing_inputs.get("scale_by", DEFAULT_HIRES["percent"] / 100)) * 100)
+    else:
+        model_name = existing_inputs.get("model_name", DEFAULT_HIRES["model_name"])
+        percent = existing_inputs.get("percent", DEFAULT_HIRES["percent"])
+    api[str(HIRES_MODEL_ID)] = {
+        "inputs": {"model_name": model_name},
+        "class_type": "UpscaleModelLoader",
+        "_meta": {"title": "高清修复模型"},
+    }
+    api[str(HIRES_UPSCALE_ID)] = {
+        "inputs": {
+            "upscale_model": [str(HIRES_MODEL_ID), 0],
+            "image": ["48", 0],
+        },
+        "class_type": "ImageUpscaleWithModel",
+        "_meta": {"title": "高清模型放大"},
+    }
+    api[str(HIRES_SCALE_ID)] = {
+        "inputs": {
+            "image": [str(HIRES_UPSCALE_ID), 0],
+            "upscale_method": "lanczos",
+            "scale_by": percent / 100,
+        },
+        "class_type": "ImageScaleBy",
+        "_meta": {"title": "高清输出比例"},
+    }
+    api["12"]["inputs"]["images"] = [str(HIRES_SCALE_ID), 0]
+
+    scale_node = _visual_node(ui, HIRES_SCALE_ID)
+    if scale_node.get("type") == "ImageScaleBy":
+        _visual_node(ui, HIRES_MODEL_ID)
+        _visual_node(ui, HIRES_UPSCALE_ID)
+        ui["last_node_id"] = max(int(ui.get("last_node_id", 0)), HIRES_UPSCALE_ID)
+        return
+    image_link = next(item["link"] for item in scale_node["inputs"] if item["name"] == "image")
+    model_link = next(item["link"] for item in scale_node["inputs"] if item["name"] == "vae")
+    output_links = next(item["links"] for item in scale_node["outputs"] if item["name"] == "image")
+    scale_link = max((int(link[0]) for link in ui.get("links", [])), default=0) + 1
+
+    for link in ui["links"]:
+        if int(link[0]) == image_link:
+            link[3:6] = [HIRES_UPSCALE_ID, 1, "IMAGE"]
+        elif int(link[0]) == model_link:
+            link[1:6] = [HIRES_MODEL_ID, 0, HIRES_UPSCALE_ID, 0, "UPSCALE_MODEL"]
+        elif int(link[0]) in output_links:
+            link[1] = HIRES_SCALE_ID
+            link[2] = 0
+    ui["links"].append([scale_link, HIRES_UPSCALE_ID, 0, HIRES_SCALE_ID, 0, "IMAGE"])
+
+    vae_node = _visual_node(ui, 22)
+    for output in vae_node.get("outputs", []):
+        links = output.get("links")
+        if isinstance(links, list) and model_link in links:
+            output["links"] = [link for link in links if link != model_link] or None
+
+    x, y = scale_node["pos"]
+    common_properties = {"cnr_id": "comfy-core", "ver": "0.11.0"}
+    ui["nodes"].extend(
+        [
+            {
+                "id": HIRES_MODEL_ID,
+                "type": "UpscaleModelLoader",
+                "pos": [x - 650, y],
+                "size": [300, 82],
+                "flags": {},
+                "order": scale_node.get("order", 0),
+                "mode": scale_node.get("mode", 0),
+                "inputs": [],
+                "outputs": [{"name": "UPSCALE_MODEL", "type": "UPSCALE_MODEL", "links": [model_link]}],
+                "properties": {**common_properties, "Node name for S&R": "UpscaleModelLoader"},
+                "widgets_values": [model_name],
+                "title": "高清修复模型",
+            },
+            {
+                "id": HIRES_UPSCALE_ID,
+                "type": "ImageUpscaleWithModel",
+                "pos": [x - 330, y],
+                "size": [300, 82],
+                "flags": {},
+                "order": scale_node.get("order", 0) + 1,
+                "mode": scale_node.get("mode", 0),
+                "inputs": [
+                    {"name": "upscale_model", "type": "UPSCALE_MODEL", "link": model_link},
+                    {"name": "image", "type": "IMAGE", "link": image_link},
+                ],
+                "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [scale_link]}],
+                "properties": {**common_properties, "Node name for S&R": "ImageUpscaleWithModel"},
+                "widgets_values": [],
+                "title": "高清模型放大",
+            },
+        ]
+    )
+    scale_node.update(
+        {
+            "type": "ImageScaleBy",
+            "size": [300, 110],
+            "inputs": [{"name": "image", "type": "IMAGE", "link": scale_link}],
+            "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": output_links}],
+            "properties": {**common_properties, "Node name for S&R": "ImageScaleBy"},
+            "widgets_values": ["lanczos", percent / 100],
+            "title": "高清输出比例",
+        }
+    )
+    ui["last_node_id"] = max(int(ui.get("last_node_id", 0)), HIRES_UPSCALE_ID)
+    ui["last_link_id"] = max(int(ui.get("last_link_id", 0)), scale_link)
+
+
+def prepare_templates(
+    api_source: dict[str, Any], ui_source: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    api = copy.deepcopy(api_source)
+    ui = copy.deepcopy(ui_source)
+
+    for node_id in ("3", "4"):
+        api.pop(node_id, None)
+    _prepare_hires_nodes(api, ui)
+    api[str(COMPOSER_ID)] = _api_composer()
+
+    positive = api[str(POSITIVE_ID)]
+    positive_clip = positive["inputs"]["clip"]
+    positive["class_type"] = "AnimaPromptPlusClipEncode"
+    positive["inputs"] = {
+        "clip": positive_clip,
+        "quality_prompt": DEFAULT_QUALITY,
+        "artist_tags": "",
+        "character_tags": "",
+        "clothing_tags": "",
+        "pose_tags": "",
+        "background_tags": "",
+        "extra_prompt": [str(COMPOSER_ID), 0],
+        "separator": ", ",
+    }
+    positive.setdefault("_meta", {})["title"] = "Anima Positive Prompt"
+
+    negative = api[str(NEGATIVE_ID)]
+    negative["inputs"] = {"text": DEFAULT_NEGATIVE, "clip": negative["inputs"]["clip"]}
+
+    _remove_visual_nodes(ui)
+    next_link_id = max((int(link[0]) for link in ui.get("links", [])), default=0) + 1
+    ui["nodes"].append(_visual_composer(next_link_id))
+
+    positive_ui = _visual_node(ui, POSITIVE_ID)
+    clip_link = next(item["link"] for item in positive_ui["inputs"] if item["name"] == "clip")
+    conditioning_links = positive_ui["outputs"][0].get("links")
+    positive_ui.update(
+        {
+            "type": "AnimaPromptPlusClipEncode",
+            "pos": [1485, 75],
+            "size": [430, 455],
+            "title": "Anima 正面提示词",
+            "inputs": [
+                {"name": "clip", "type": "CLIP", "link": clip_link},
+                {"name": "quality_prompt", "type": "STRING", "widget": {"name": "quality_prompt"}, "link": None},
+                {"name": "artist_tags", "type": "STRING", "widget": {"name": "artist_tags"}, "link": None},
+                {"name": "character_tags", "type": "STRING", "widget": {"name": "character_tags"}, "link": None},
+                {"name": "clothing_tags", "type": "STRING", "widget": {"name": "clothing_tags"}, "link": None},
+                {"name": "pose_tags", "type": "STRING", "widget": {"name": "pose_tags"}, "link": None},
+                {"name": "background_tags", "type": "STRING", "widget": {"name": "background_tags"}, "link": None},
+                {"name": "extra_prompt", "type": "STRING", "widget": {"name": "extra_prompt"}, "link": next_link_id},
+                {"name": "separator", "type": "STRING", "widget": {"name": "separator"}, "link": None},
+            ],
+            "outputs": [
+                {"name": "positive", "type": "CONDITIONING", "slot_index": 0, "links": conditioning_links},
+                {"name": "text", "type": "STRING", "slot_index": 1, "links": None},
+            ],
+            "widgets_values": [DEFAULT_QUALITY, "", "", "", "", "", "", "", ", "],
+            "properties": {
+                "Node name for S&R": "AnimaPromptPlusClipEncode",
+                "cnr_id": "Comfyui-Anima-Tools",
+            },
+            "color": "#253b36",
+            "bgcolor": "#35534b",
+        }
+    )
+
+    negative_ui = _visual_node(ui, NEGATIVE_ID)
+    negative_clip_link = next(item["link"] for item in negative_ui["inputs"] if item["name"] == "clip")
+    negative_ui["pos"] = [1485, 555]
+    negative_ui["size"] = [430, 175]
+    negative_ui["inputs"] = [
+        {"name": "clip", "type": "CLIP", "link": negative_clip_link},
+        {"name": "text", "type": "STRING", "widget": {"name": "text"}, "link": None},
+    ]
+    negative_ui["widgets_values"] = [DEFAULT_NEGATIVE]
+
+    ui["links"].append([next_link_id, COMPOSER_ID, 0, POSITIVE_ID, 7, "STRING"])
+    ui["last_node_id"] = max(int(ui.get("last_node_id", 0)), COMPOSER_ID)
+    ui["last_link_id"] = max(int(ui.get("last_link_id", 0)), next_link_id)
+    return api, ui
+
+
+def _set_ui_widget(ui: dict[str, Any], node_id: int, value: Any, index: int | None = None) -> None:
+    node = _visual_node(ui, node_id)
+    if index is None:
+        node["widgets_values"] = value
+        return
+    values = list(node.get("widgets_values") or [])
+    while len(values) <= index:
+        values.append("")
+    values[index] = value
+    node["widgets_values"] = values
+
+
+def _set_ui_mode(ui: dict[str, Any], node_id: int, enabled: bool) -> None:
+    _visual_node(ui, node_id)["mode"] = 0 if enabled else 4
+
+
+def _disconnect_ui_input(ui: dict[str, Any], node_id: int, input_name: str) -> None:
+    node = _visual_node(ui, node_id)
+    input_spec = next((item for item in node.get("inputs", []) if item.get("name") == input_name), None)
+    if not isinstance(input_spec, dict):
+        return
+    link_id = input_spec.get("link")
+    input_spec["link"] = None
+    if link_id is None:
+        return
+    ui["links"] = [link for link in ui.get("links", []) if int(link[0]) != int(link_id)]
+    for candidate in ui.get("nodes", []):
+        for output in candidate.get("outputs", []):
+            links = output.get("links")
+            if isinstance(links, list):
+                output["links"] = [value for value in links if int(value) != int(link_id)] or None
+
+
+def _ui_widgets(ui: dict[str, Any], node_id: int) -> list[Any]:
+    return list(_visual_node(ui, node_id).get("widgets_values") or [])
+
+
+def _detailer_nodes(
+    ui: dict[str, Any], name: str, image: list[Any]
+) -> tuple[dict[str, dict[str, Any]], list[Any]]:
+    config = DETAILER_NODES[name]
+    detector_id = config["detector"]
+    editor_id = config["editor"]
+    detailer_id = config["detailer"]
+    detector_ui = _visual_node(ui, detector_id)
+    detector_widgets = _ui_widgets(ui, detector_id)
+    editor_widgets = _ui_widgets(ui, editor_id)
+    detailer_widgets = _ui_widgets(ui, detailer_id)
+    detector_type = detector_ui["type"]
+    detector = {
+        "inputs": {"model_name": detector_widgets[0]},
+        "class_type": detector_type,
+        "_meta": {"title": detector_ui.get("title") or detector_type},
+    }
+    editor_inputs = {
+        "wildcard": editor_widgets[0],
+        "Select to add LoRA": "Select the LoRA to add to the text",
+        "Select to add Wildcard": "Select the Wildcard to add to the text",
+        "detailer_pipe": ["18", 0],
+        config["detector_input"]: [str(detector_id), config.get("detector_output", 0)],
+    }
+    editor = {
+        "inputs": editor_inputs,
+        "class_type": "EditDetailerPipe",
+        "_meta": {"title": _visual_node(ui, editor_id).get("title") or f"{name.title()} Detailer Pipe"},
+    }
+    detailer_inputs = {
+        "image": image,
+        "detailer_pipe": [str(editor_id), 0],
+        "guide_size": detailer_widgets[0],
+        "guide_size_for": detailer_widgets[1],
+        "max_size": detailer_widgets[2],
+        "seed": ["37", 0],
+        "steps": detailer_widgets[5],
+        "cfg": detailer_widgets[6],
+        "sampler_name": detailer_widgets[7],
+        "scheduler": detailer_widgets[8],
+        "denoise": detailer_widgets[9],
+        "feather": detailer_widgets[10],
+        "noise_mask": detailer_widgets[11],
+        "force_inpaint": detailer_widgets[12],
+        "bbox_threshold": detailer_widgets[13],
+        "bbox_dilation": detailer_widgets[14],
+        "bbox_crop_factor": detailer_widgets[15],
+        "sam_detection_hint": detailer_widgets[16],
+        "sam_dilation": detailer_widgets[17],
+        "sam_threshold": detailer_widgets[18],
+        "sam_bbox_expansion": detailer_widgets[19],
+        "sam_mask_hint_threshold": detailer_widgets[20],
+        "sam_mask_hint_use_negative": detailer_widgets[21],
+        "drop_size": detailer_widgets[22],
+        "refiner_ratio": detailer_widgets[23],
+        "cycle": detailer_widgets[24],
+        "noise_mask_feather": detailer_widgets[26],
+        "tiled_encode": ["50", 0],
+        "tiled_decode": ["50", 0],
+    }
+    detailer = {
+        "inputs": detailer_inputs,
+        "class_type": "FaceDetailerPipe",
+        "_meta": {"title": _visual_node(ui, detailer_id).get("title") or f"{name.title()} Detailer"},
+    }
+    return {
+        str(detector_id): detector,
+        str(editor_id): editor,
+        str(detailer_id): detailer,
+    }, [str(detailer_id), 0]
+
+
+def render_workflows(
+    api_template: dict[str, Any],
+    ui_template: dict[str, Any],
+    settings: dict[str, Any],
+    sample_seed: int,
+    prompt_seed: int,
+    filename_prefix: str,
+    resolved_prompt: str = "",
+    resolved_selection: dict[str, Any] | None = None,
+    resolved_prompt_full: str = "",
+    frozen_positive_prompt: str = "",
+    frozen_negative_prompt: str = "",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    settings = validate_settings(settings)
+    if not 0 <= sample_seed <= MAX_SAMPLE_SEED:
+        raise WorkflowError("sample_seed 超出范围")
+    if not 0 <= prompt_seed <= 2**31 - 1:
+        raise WorkflowError("prompt_seed 超出范围")
+
+    api = copy.deepcopy(api_template)
+    ui = copy.deepcopy(ui_template)
+    api["1"]["inputs"]["unet_name"] = settings["model_name"]
+    cfg_zero_star = settings["cfg_zero_star"]
+    model_ref: list[Any] = [str(CFG_ZERO_STAR_ID), 0] if cfg_zero_star else ["2", 0]
+    if cfg_zero_star:
+        api[str(CFG_ZERO_STAR_ID)] = {
+            "inputs": {"model": ["2", 0]},
+            "class_type": "CFGZeroStar",
+            "_meta": {"title": "CFGZeroStar"},
+        }
+    else:
+        api.pop(str(CFG_ZERO_STAR_ID), None)
+    api["5"]["inputs"]["model"] = model_ref
+    if "26" in api:
+        api["26"]["inputs"]["model"] = model_ref
+
+    second_sampler = settings["second_sampler"]
+    if second_sampler["enabled"]:
+        api[str(SECOND_SAMPLER_ID)] = {
+            "inputs": {
+                "seed": ["37", 0],
+                "steps": second_sampler["steps"],
+                "cfg": second_sampler["cfg"],
+                "sampler_name": second_sampler["sampler_name"],
+                "scheduler": second_sampler["scheduler"],
+                "denoise": second_sampler["denoise"],
+                "model": model_ref,
+                "positive": [str(POSITIVE_ID), 0],
+                "negative": [str(NEGATIVE_ID), 0],
+                "latent_image": ["5", 0],
+            },
+            "class_type": "KSampler",
+            "_meta": {"title": "2ndSampler"},
+        }
+        api["48"]["inputs"]["samples"] = [str(SECOND_SAMPLER_ID), 0]
+    else:
+        api.pop(str(SECOND_SAMPLER_ID), None)
+        api["48"]["inputs"]["samples"] = ["5", 0]
+
+    # The SAM loader is only needed when at least one detailer is active.
+    sam_enabled = any(settings["detailers"].values())
+    if sam_enabled:
+        if str(SAM_LOADER_ID) not in api:
+            raise WorkflowError("工作流缺少 SAMLoader 节点 7")
+        detailer_pipe = api.get(str(DETAILER_PIPE_ID))
+        if not isinstance(detailer_pipe, dict) or not isinstance(detailer_pipe.get("inputs"), dict):
+            raise WorkflowError("工作流缺少 ToDetailerPipe 节点 18")
+        detailer_pipe["inputs"]["sam_model_opt"] = [str(SAM_LOADER_ID), 0]
+    else:
+        api.pop(str(SAM_LOADER_ID), None)
+        detailer_pipe = api.get(str(DETAILER_PIPE_ID))
+        if isinstance(detailer_pipe, dict) and isinstance(detailer_pipe.get("inputs"), dict):
+            detailer_pipe["inputs"].pop("sam_model_opt", None)
+
+    _set_ui_mode(ui, CFG_ZERO_STAR_ID, cfg_zero_star)
+    _set_ui_mode(ui, SECOND_SAMPLER_ID, second_sampler["enabled"])
+    _set_ui_mode(ui, SAM_LOADER_ID, sam_enabled)
+    if not sam_enabled:
+        _disconnect_ui_input(ui, DETAILER_PIPE_ID, "sam_model_opt")
+    if second_sampler["enabled"]:
+        _disconnect_ui_input(ui, SECOND_SAMPLER_ID, "cfg")
+    _set_ui_widget(ui, 1, settings["model_name"], 0)
+    lora_node = api.get("2")
+    if not isinstance(lora_node, dict) or not isinstance(lora_node.get("inputs"), dict):
+        raise WorkflowError("工作流缺少 LoRA 节点 2")
+    lora_inputs = lora_node["inputs"]
+    for key in list(lora_inputs):
+        if key.startswith("lora_"):
+            del lora_inputs[key]
+    for index, item in enumerate(settings["loras"], 1):
+        lora_inputs[f"lora_{index}"] = {
+            "on": item["enabled"],
+            "lora": item["filename"],
+            "strength": item["strength"],
+        }
+    lora_ui = _visual_node(ui, 2)
+    lora_ui["widgets_values"] = [
+        {},
+        {"type": "PowerLoraLoaderHeaderWidget"},
+        *[
+            {
+                "on": item["enabled"],
+                "lora": item["filename"],
+                "strength": item["strength"],
+                "strengthTwo": None,
+            }
+            for item in settings["loras"]
+        ],
+        {},
+        "",
+    ]
+    frozen_positive_prompt = str(frozen_positive_prompt or "")
+    frozen_negative_prompt = str(frozen_negative_prompt or "")
+    composer_inputs = api[str(COMPOSER_ID)]["inputs"]
+    resolved_composer_prompt = frozen_positive_prompt or resolved_prompt
+    composer_inputs.update(
+        {
+            "enable_artist": False,
+            "enable_character": settings["random_character"],
+            "enable_clothing": settings["random_clothing"],
+            "enable_background": settings["random_background"],
+            "enable_pose": settings["random_pose"],
+            "character_detail": settings["character_detail"],
+            # The server already resolves the selected catalog entries using
+            # prompt_seed. A non-negative seed makes AnimaPromptComposer draw a
+            # second, unrelated character/clothing prompt and ignore the exact
+            # resolved text (including role/expression pool selections).
+            "seed": -1 if str(resolved_composer_prompt or "").strip() else prompt_seed,
+            "artist_count": 0,
+            "preview_collapsed": False,
+            "resolved_prompt": resolved_composer_prompt,
+            "character_count": settings["random_character_count"],
+            "clothing_count": settings["random_clothing_count"],
+            "pose_count": settings["random_pose_count"],
+            "background_count": settings["random_background_count"],
+            "extra_prompt": ""
+            if frozen_positive_prompt or resolved_prompt
+            else settings["extra_prompt"],
+        }
+    )
+    positive = api[str(POSITIVE_ID)]["inputs"]
+    injected_full_prompt = frozen_positive_prompt
+    positive["quality_prompt"] = "" if injected_full_prompt else settings["quality_prompt"]
+    positive["artist_tags"] = "" if injected_full_prompt else settings["manual_artist"]
+    positive["character_tags"] = "" if injected_full_prompt or settings["random_character"] else settings["fixed_character"]
+    positive["clothing_tags"] = "" if injected_full_prompt or settings["random_clothing"] else settings["fixed_clothing"]
+    positive["pose_tags"] = "" if injected_full_prompt or settings["random_pose"] else settings["fixed_pose"]
+    positive["background_tags"] = "" if injected_full_prompt or settings["random_background"] else settings["fixed_background"]
+    positive["extra_prompt"] = [str(COMPOSER_ID), 0]
+    api[str(NEGATIVE_ID)]["inputs"]["text"] = frozen_negative_prompt or settings["negative_prompt"]
+    api["23"]["inputs"]["value"] = settings["width"]
+    api["31"]["inputs"]["value"] = settings["height"]
+    api["35"]["inputs"]["value"] = 1
+    api["37"]["inputs"]["seed"] = sample_seed
+    api["39"]["inputs"]["value"] = settings["steps"]
+    api["41"]["inputs"]["value"] = settings["cfg"]
+    api["5"]["inputs"]["sampler_name"] = settings["sampler_name"]
+    api["5"]["inputs"]["scheduler"] = settings["scheduler"]
+    api["12"]["inputs"]["filename_prefix"] = filename_prefix
+
+    current_image: list[Any] = ["48", 0]
+    hires = settings["hires"]
+    if hires["enabled"]:
+        api[str(HIRES_MODEL_ID)]["inputs"]["model_name"] = hires["model_name"]
+        api[str(HIRES_UPSCALE_ID)]["inputs"]["image"] = current_image
+        api[str(HIRES_SCALE_ID)]["inputs"]["scale_by"] = hires["percent"] / 100
+        current_image = [str(HIRES_SCALE_ID), 0]
+    else:
+        for node_id in (HIRES_MODEL_ID, HIRES_UPSCALE_ID, HIRES_SCALE_ID):
+            api.pop(str(node_id), None)
+    for node_id in (HIRES_MODEL_ID, HIRES_UPSCALE_ID, HIRES_SCALE_ID):
+        _set_ui_mode(ui, node_id, hires["enabled"])
+    _set_ui_widget(ui, HIRES_MODEL_ID, hires["model_name"], 0)
+    _set_ui_widget(ui, HIRES_SCALE_ID, hires["percent"] / 100, 1)
+
+    for name in DETAILER_ORDER:
+        config = DETAILER_NODES[name]
+        enabled = settings["detailers"][name]
+        for node_id in (config["detector"], config["editor"], config["detailer"]):
+            _set_ui_mode(ui, node_id, enabled)
+        if enabled:
+            nodes, current_image = _detailer_nodes(ui, name, current_image)
+            api.update(nodes)
+        else:
+            for node_id in (config["detector"], config["editor"], config["detailer"]):
+                api.pop(str(node_id), None)
+    api["12"]["inputs"]["images"] = current_image
+    _set_ui_mode(ui, 52, False)
+
+    _set_ui_widget(
+        ui,
+        COMPOSER_ID,
+        [
+            False,
+            settings["random_character"],
+            settings["random_clothing"],
+            settings["random_background"],
+            settings["random_pose"],
+            settings["character_detail"],
+            prompt_seed,
+            0,
+            False,
+            frozen_positive_prompt or resolved_prompt,
+            settings["random_character_count"],
+            settings["random_clothing_count"],
+            settings["random_pose_count"],
+            settings["random_background_count"],
+            ""
+            if frozen_positive_prompt or resolved_prompt
+            else settings["extra_prompt"],
+        ],
+    )
+    _set_ui_widget(ui, POSITIVE_ID, positive["quality_prompt"], 0)
+    _set_ui_widget(ui, POSITIVE_ID, positive["artist_tags"], 1)
+    _set_ui_widget(ui, POSITIVE_ID, positive["character_tags"], 2)
+    _set_ui_widget(ui, POSITIVE_ID, positive["clothing_tags"], 3)
+    _set_ui_widget(ui, POSITIVE_ID, positive["pose_tags"], 4)
+    _set_ui_widget(ui, POSITIVE_ID, positive["background_tags"], 5)
+    _set_ui_widget(ui, POSITIVE_ID, settings["extra_prompt"], 7)
+    _set_ui_widget(ui, NEGATIVE_ID, api[str(NEGATIVE_ID)]["inputs"]["text"], 0)
+    for node_id, value in ((23, settings["width"]), (31, settings["height"]), (35, 1), (39, settings["steps"]), (41, settings["cfg"]), (12, filename_prefix)):
+        _set_ui_widget(ui, node_id, value, 0)
+    _set_ui_widget(ui, 37, sample_seed, 0)
+    _set_ui_widget(ui, 5, settings["sampler_name"], 4)
+    _set_ui_widget(ui, 5, settings["scheduler"], 5)
+    _set_ui_widget(ui, SECOND_SAMPLER_ID, sample_seed, 0)
+    _set_ui_widget(ui, SECOND_SAMPLER_ID, second_sampler["steps"], 2)
+    _set_ui_widget(ui, SECOND_SAMPLER_ID, second_sampler["cfg"], 3)
+    _set_ui_widget(ui, SECOND_SAMPLER_ID, second_sampler["sampler_name"], 4)
+    _set_ui_widget(ui, SECOND_SAMPLER_ID, second_sampler["scheduler"], 5)
+    _set_ui_widget(ui, SECOND_SAMPLER_ID, second_sampler["denoise"], 6)
+    return api, ui
+
+
+def build_submission(
+    api_template: dict[str, Any],
+    ui_template: dict[str, Any],
+    settings: dict[str, Any],
+    sample_seed: int,
+    prompt_seed: int,
+    filename_prefix: str,
+    client_id: str,
+    sequence: int,
+    resolved_prompt: str = "",
+    resolved_selection: dict[str, Any] | None = None,
+    resolved_prompt_full: str = "",
+    frozen_positive_prompt: str = "",
+    frozen_negative_prompt: str = "",
+) -> dict[str, Any]:
+    api, ui = render_workflows(
+        api_template,
+        ui_template,
+        settings,
+        sample_seed,
+        prompt_seed,
+        filename_prefix,
+        resolved_prompt,
+        resolved_selection,
+        resolved_prompt_full,
+        frozen_positive_prompt,
+        frozen_negative_prompt,
+    )
+    metadata = {
+        "settings": validate_settings(settings),
+        "sample_seed": sample_seed,
+        "prompt_seed": prompt_seed,
+        "sequence": sequence,
+        "resolved_selection": resolved_selection or {},
+        "resolved_prompt": resolved_prompt,
+        "resolved_prompt_full": resolved_prompt_full,
+        "frozen_positive_prompt": frozen_positive_prompt,
+        # Random Studio already resolved the catalog selection; do not let
+        # Anima Tools draw an unrelated prompt while queueing this workflow.
+        "authoritative_resolved_prompt": bool(
+            str(frozen_positive_prompt or resolved_prompt or "").strip()
+        ),
+    }
+    return {
+        "prompt": api,
+        "client_id": client_id,
+        "extra_data": {"extra_pnginfo": {"workflow": ui, "anima_random_webui": metadata}},
+    }
+
+
+class WorkflowTemplates:
+    def __init__(self, api_template: dict[str, Any], ui_template: dict[str, Any]):
+        validate_template_nodes(api_template, ui_template)
+        self.api = api_template
+        self.ui = ui_template
+
+    @classmethod
+    def load(cls, template_dir: str | Path) -> "WorkflowTemplates":
+        directory = Path(template_dir)
+        return cls(read_json(directory / "workflow_api.json"), read_json(directory / "workflow_ui.json"))
+
+    def submission(
+        self,
+        settings: dict[str, Any],
+        sample_seed: int,
+        prompt_seed: int,
+        filename_prefix: str,
+        client_id: str,
+        sequence: int,
+        resolved_prompt: str = "",
+        resolved_selection: dict[str, Any] | None = None,
+        resolved_prompt_full: str = "",
+        frozen_positive_prompt: str = "",
+        frozen_negative_prompt: str = "",
+    ) -> dict[str, Any]:
+        return build_submission(
+            self.api,
+            self.ui,
+            settings,
+            sample_seed,
+            prompt_seed,
+            filename_prefix,
+            client_id,
+            sequence,
+            resolved_prompt,
+            resolved_selection,
+            resolved_prompt_full,
+            frozen_positive_prompt,
+            frozen_negative_prompt,
+        )
